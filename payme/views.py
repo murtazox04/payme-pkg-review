@@ -11,11 +11,10 @@ from rest_framework.response import Response
 
 from payme import exceptions
 from payme.types import response
-from payme.models import PaymeTransactions
 from payme.util import time_to_payme, time_to_service
 
 logger = logging.getLogger(__name__)
-AccountModel = import_string(settings.PAYME_ACCOUNT_MODEL)
+TransactionModel = import_string(settings.PAYME_TRANSACTION_MODEL)
 
 
 def handle_exceptions(func):
@@ -25,32 +24,24 @@ def handle_exceptions(func):
     def wrapper(*args, **kwargs):
         try:
             return func(*args, **kwargs)
-        except KeyError as exc:
-            message = "Invalid parameters received."
-            logger.error(f"{message}: {exc}s {exc} {args} {kwargs}")
-            raise exceptions.InternalServiceError(message) from exc
-
-        except AccountModel.DoesNotExist as exc:
-            logger.error(f"Account does not exist: {exc} {args} {kwargs}")
-            raise exceptions.AccountDoesNotExist(str(exc)) from exc
-
-        except PaymeTransactions.DoesNotExist as exc:
+        except TransactionModel.DoesNotExist as exc:
             logger.error(f"Transaction does not exist: {exc} {args} {kwargs}")
             raise exceptions.AccountDoesNotExist(str(exc)) from exc
-
         except exceptions.exception_whitelist as exc:
-            # No need to raise exception for exception whitelist
             raise exc
+        except KeyError as exc:
+            message = "Invalid parameters received."
+            logger.error(f"{message}: {exc} {args} {kwargs}")
+            raise exceptions.InternalServiceError(message) from exc
         except Exception as exc:
             logger.error(f"Unexpected error: {exc} {args} {kwargs}")
             raise exceptions.InternalServiceError(str(exc)) from exc
-
     return wrapper
 
 
 class PaymeWebHookAPIView(views.APIView):
     """
-    A webhook view for Payme.
+    A webhook view for Payme using the custom Transaction model.
     """
     authentication_classes = ()
 
@@ -108,49 +99,30 @@ class PaymeWebHookAPIView(views.APIView):
             raise exceptions.PermissionDenied("Invalid merchant key specified")
 
     @handle_exceptions
-    def fetch_account(self, params: dict):
+    def check_perform_transaction(self, params) -> response.CheckPerformTransaction:
         """
-        Fetch account based on settings and params.
+        Before creating a transaction, verify if you can perform it.
+        For simplicity, just return allow=True if the transaction is valid.
+        
+        params['amount'] is in tiyin (1 sum = 100 tiyin).
+        params['account'][settings.PAYME_ACCOUNT_FIELD] identifies the transaction.
         """
+        # Example: use order_id from params to find the transaction.
         account_field = settings.PAYME_ACCOUNT_FIELD
-
-        account_value = params['account'].get(account_field)
-        if not account_value:
+        transaction_id = params['account'].get(account_field)
+        if not transaction_id:
             raise exceptions.InvalidAccount("Missing account field in parameters.")
 
-        # hard change
-        if account_field == "order_id":
-            account_field = "id"
-
-        account = AccountModel.objects.get(**{account_field: account_value})
-
-        return account
-
-    @handle_exceptions
-    def validate_amount(self, account, amount):
-        """
-        Validates if the amount matches for one-time payment accounts.
-        """
-        if not settings.PAYME_ONE_TIME_PAYMENT:
-            return True
-
-        expected_amount = Decimal(getattr(account, settings.PAYME_AMOUNT_FIELD)) * 100
-        received_amount = Decimal(amount)
-
-        if expected_amount != received_amount:
+        # Get or validate transaction (for now, we just check existence)
+        tran = TransactionModel.objects.get(id=transaction_id)
+        
+        # Validate amount matches tran.total_price * 100 if needed:
+        received_amount = Decimal(params.get('amount', 0))
+        expected_amount = tran.total_price * 100
+        if received_amount != expected_amount:
             raise exceptions.IncorrectAmount(
                 f"Invalid amount. Expected: {expected_amount}, received: {received_amount}"
             )
-
-        return True
-
-    @handle_exceptions
-    def check_perform_transaction(self, params) -> response.CheckPerformTransaction:
-        """
-        Handle the pre_create_transaction action.
-        """
-        account = self.fetch_account(params)
-        self.validate_amount(account, params.get('amount'))
 
         result = response.CheckPerformTransaction(allow=True)
         return result.as_resp()
@@ -158,180 +130,171 @@ class PaymeWebHookAPIView(views.APIView):
     @handle_exceptions
     def create_transaction(self, params) -> response.CreateTransaction:
         """
-        Handle the create_transaction action.
+        Create a transaction in Payme's terms.
+        Actually, transaction might already exist in your system.
+        
+        params['id'] is Payme's transaction_id.
+        Use ext_id or create if needed.
         """
-        transaction_id = params["id"]
-        amount = Decimal(params.get('amount', 0))
-        account = self.fetch_account(params)
+        payme_tr_id = params["id"]  # Payme's internal transaction ID
+        account_field = settings.PAYME_ACCOUNT_FIELD
+        transaction_id = params["account"].get(account_field)
+        if not transaction_id:
+            raise exceptions.InvalidAccount("Missing account field in parameters.")
 
-        self.validate_amount(account, amount)
+        tran = TransactionModel.objects.get(id=transaction_id)
+        # Validate amount
+        received_amount = Decimal(params.get('amount', 0))
+        expected_amount = tran.total_price * 100
+        if received_amount != expected_amount:
+            raise exceptions.IncorrectAmount(
+                f"Invalid amount. Expected: {expected_amount}, received: {received_amount}"
+            )
 
-        defaults = {
-            "amount": amount,
-            "state": PaymeTransactions.INITIATING,
-            "account": account,
-        }
+        # Set ext_id if needed
+        if not tran.ext_id:
+            tran.ext_id = payme_tr_id
+            tran.save(update_fields=["ext_id"])
 
-        # Handle already existing transaction with the same ID for one-time payments
-        if settings.PAYME_ONE_TIME_PAYMENT:
-            # Check for an existing transaction with a different transaction_id for the given account
-            if PaymeTransactions.objects.filter(account=account).exclude(transaction_id=transaction_id).exists():
-                message = f"Transaction {transaction_id} already exists (Payme)."
-                logger.warning(message)
-                raise exceptions.TransactionAlreadyExists(message)
-
-        transaction, _ = PaymeTransactions.objects.get_or_create(
-            transaction_id=transaction_id,
-            defaults=defaults
-        )
-
+        # Payme considers INITIATING state as well
+        # Your transaction status is "waiting" initially, map to INITIATING(1) or CREATED(0)
+        # Just return current state mapped.
         result = response.CreateTransaction(
-            transaction=transaction.transaction_id,
-            state=transaction.state,
-            create_time=time_to_payme(transaction.created_at),
-        )
-        result = result.as_resp()
+            transaction=tran.ext_id,
+            state=tran.payme_state(),
+            create_time=time_to_payme(tran.created_at),
+        ).as_resp()
 
-        # callback event
         self.handle_created_payment(params, result)
-
         return result
 
     @handle_exceptions
     def perform_transaction(self, params) -> response.PerformTransaction:
         """
-        Handle the successful payment.
+        Mark the transaction as performed (successful).
         """
-        transaction = PaymeTransactions.get_by_transaction_id(transaction_id=params["id"])
+        payme_tr_id = params["id"]
+        # Retrieve by ext_id
+        tran = TransactionModel.objects.get(ext_id=payme_tr_id)
 
-        if transaction.is_performed():
+        if tran.is_performed():
+            # Already performed
             result = response.PerformTransaction(
-                transaction=transaction.transaction_id,
-                state=transaction.state,
-                perform_time=time_to_payme(transaction.performed_at),
+                transaction=tran.ext_id,
+                state=tran.payme_state(),
+                perform_time=time_to_payme(tran.confirmed_at),
             )
             return result.as_resp()
 
-        transaction.mark_as_performed()
+        # Perform the transaction
+        success = tran.mark_as_performed()
+        if not success:
+            # If couldn't perform, maybe raise an error or handle accordingly
+            raise exceptions.InternalServiceError("Cannot perform transaction")
 
         result = response.PerformTransaction(
-            transaction=transaction.transaction_id,
-            state=transaction.state,
-            perform_time=time_to_payme(transaction.performed_at),
-        )
-        result = result.as_resp()
+            transaction=tran.ext_id,
+            state=tran.payme_state(),
+            perform_time=time_to_payme(tran.confirmed_at),
+        ).as_resp()
 
-        # callback successfully event
         self.handle_successfully_payment(params, result)
-
         return result
 
     @handle_exceptions
-    def check_transaction(self, params: dict) -> dict | str | response.CheckPerformTransaction:
+    def check_transaction(self, params: dict):
         """
-        Handle check transaction request.
+        Check the transaction status.
         """
-        transaction = PaymeTransactions.get_by_transaction_id(transaction_id=params["id"])
+        payme_tr_id = params["id"]
+        tran = TransactionModel.objects.get(ext_id=payme_tr_id)
+
+        # reason field can be deduced if you stored cancel_reason in tran.data
+        reason = None
+        if tran.data and "cancel_reason" in tran.data:
+            reason = tran.data["cancel_reason"]
 
         result = response.CheckTransaction(
-            transaction=transaction.transaction_id,
-            state=transaction.state,
-            reason=transaction.cancel_reason,
-            create_time=time_to_payme(transaction.created_at),
-            perform_time=time_to_payme(transaction.performed_at),
-            cancel_time=time_to_payme(transaction.cancelled_at),
+            transaction=tran.ext_id,
+            state=tran.payme_state(),
+            reason=reason,
+            create_time=time_to_payme(tran.created_at),
+            perform_time=time_to_payme(tran.confirmed_at),
+            cancel_time=time_to_payme(tran.canceled_at),
         )
-
         return result.as_resp()
 
     @handle_exceptions
     def cancel_transaction(self, params) -> response.CancelTransaction:
         """
-        Handle the cancelled payment.
+        Cancel the transaction.
         """
-        transaction = PaymeTransactions.get_by_transaction_id(transaction_id=params["id"])
+        payme_tr_id = params["id"]
+        cancel_reason = params["reason"]
+        tran = TransactionModel.objects.get(ext_id=payme_tr_id)
 
-        if transaction.is_cancelled():
-            return self._cancel_response(transaction)
+        if tran.is_cancelled():
+            return self._cancel_response(tran)
 
-        if transaction.is_performed():
-            transaction.mark_as_cancelled(
-                cancel_reason=params["reason"],
-                state=PaymeTransactions.CANCELED
-            )
-        elif transaction.is_created_in_payme():
-            transaction.mark_as_cancelled(
-                cancel_reason=params["reason"],
-                state=PaymeTransactions.CANCELED_DURING_INIT
-            )
+        # If transaction performed, mark as canceled after success (-2)
+        # If not performed, canceled during init (-1)
+        payme_state = -1
+        if tran.is_performed():
+            payme_state = -2
 
-        result = self._cancel_response(transaction)
+        tran.mark_as_cancelled(cancel_reason=cancel_reason, payme_state=payme_state)
+        result = self._cancel_response(tran)
 
-        # callback cancelled transaction event
         self.handle_cancelled_payment(params, result)
-
         return result
 
     @handle_exceptions
-    def get_statement(self, params) -> response.GetStatement:
+    def get_statement(self, params):
         """
-        Retrieves a statement of transactions.
+        Retrieve a statement of transactions by date range.
         """
-        date_range = [time_to_service(params['from']), time_to_service(params['to'])]
+        from_time = time_to_service(params['from'])
+        to_time = time_to_service(params['to'])
 
-        transactions = PaymeTransactions.objects.filter(
-            created_at__range=date_range
+        transactions = TransactionModel.objects.filter(
+            created_at__range=[from_time, to_time]
         ).order_by('-created_at')
 
         result = response.GetStatement(transactions=[])
 
-        for transaction in transactions:
+        for t in transactions:
+            reason = None
+            if t.data and "cancel_reason" in t.data:
+                reason = t.data["cancel_reason"]
+
             result.transactions.append({
-                "transaction": transaction.transaction_id,
-                "amount": transaction.amount,
+                "transaction": t.ext_id or str(t.id),
+                "amount": t.total_price * 100,  # in tiyin
                 "account": {
-                    settings.PAYME_ACCOUNT_FIELD: transaction.account.id
+                    settings.PAYME_ACCOUNT_FIELD: str(t.id)
                 },
-                "reason": transaction.cancel_reason,
-                "state": transaction.state,
-                "create_time": time_to_payme(transaction.created_at),
-                "perform_time": time_to_payme(transaction.performed_at),
-                "cancel_time": time_to_payme(transaction.cancelled_at),
+                "reason": reason,
+                "state": t.payme_state(),
+                "create_time": time_to_payme(t.created_at),
+                "perform_time": time_to_payme(t.confirmed_at),
+                "cancel_time": time_to_payme(t.canceled_at),
             })
 
         return result.as_resp()
 
     def _cancel_response(self, transaction):
-        """
-        Helper method to generate cancel transaction response.
-        """
         result = response.CancelTransaction(
-            transaction=transaction.transaction_id,
-            state=transaction.state,
-            cancel_time=time_to_payme(transaction.cancelled_at),
+            transaction=transaction.ext_id,
+            state=transaction.payme_state(),
+            cancel_time=time_to_payme(transaction.canceled_at),
         )
         return result.as_resp()
 
-    def handle_pre_payment(self, params, result, *args, **kwargs):
-        """
-        Handle the pre_create_transaction action. You can override this method
-        """
-        print(f"Transaction pre_created for this params: {params} and pre_created_result: {result}")
-
     def handle_created_payment(self, params, result, *args, **kwargs):
-        """
-        Handle the successful payment. You can override this method
-        """
-        print(f"Transaction created for this params: {params} and cr_result: {result}")
+        print(f"Transaction created with params: {params}, result: {result}")
 
     def handle_successfully_payment(self, params, result, *args, **kwargs):
-        """
-        Handle the successful payment. You can override this method
-        """
-        print(f"Transaction successfully performed for this params: {params} and performed_result: {result}")
+        print(f"Transaction successfully performed with params: {params}, result: {result}")
 
     def handle_cancelled_payment(self, params, result, *args, **kwargs):
-        """
-        Handle the cancelled payment. You can override this method
-        """
-        print(f"Transaction cancelled for this params: {params} and cancelled_result: {result}")
+        print(f"Transaction cancelled with params: {params}, result: {result}")
